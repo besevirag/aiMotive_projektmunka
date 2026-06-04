@@ -1,125 +1,130 @@
 import os
-import cv2
-import numpy as np
 import torch
-from torch.utils.data import DataLoader
+import logging
+
+import segmentation_models_pytorch as smp
+import pandas as pd
+
+from torch.utils.data import DataLoader, ConcatDataset
+from torch.amp import GradScaler
 from src.logger import setup_logger
 from src.data_loader import Dataset
+from train import train_epoch
 
-def lossfunc(preds: torch.Tensor, targets: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
-    """
-    kiszámoljuk a maszkolt l1 veszteséget a ritka mélységtérképen.
-    preds: háló tippje [Batch, 1, H, W]
-    targets: valódi mélység (depth) [Batch, 1, H, W]
-    masks: bináris maszk (gt_mask) [Batch, 1, H, W]
-    """
-    absolute_error=torch.abs(preds-targets)
-    masked_error=absolute_error*masks
+MODEL_ID = "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf"
 
-    total_loss=torch.sum(masked_error)
-    valid_pixels=torch.sum(masks)
+BASE_FOLDER = "/mnt/oldssd/aimotive-dataset/train/"
+CSV_PATH = "./data/id_data.csv"
+OUTPUT_DIR = "batch_test"
+CHECKPOINT_DIR = "weights"
+DATA_DIRS = ["highway", "night", "rain", "urban"]
 
-    if valid_pixels==0:
-        return torch.tensor(0.0, device=preds.device, requires_grad=True)
+EPOCHS = 5
+BATCH_SIZE = 7
+GRAD_ACCUM_STEPS = 1
+LR = 1e-3
 
-    return total_loss/valid_pixels
 
-def train_epoch(
-    model,
-    train_loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    device: str,
-    epochs: int = 5
-):
-    # model.train()
-    running_loss = .0
-
-    for i, data in enumerate(train_loader):
-        images = data["image"].to(device)
-        depths = data["depth"].to(device)
-        masks = data["gt_mask"].to(device)
-
-        optimizer.zero_grad()
-        # preds = model.predict(images)
-        # optimizer.step()
-
-        # running_loss += loss.item()
+def save_checkpoint(
+        model,
+        optimizer,
+        scaler,
+        epoch: int,
+        loss: float,
+        logger
+) -> None:
+    """Modell állapot mentése .pt fájlba."""
+    path = os.path.join(
+        CHECKPOINT_DIR,
+        f"epoch_{epoch:03d}_loss_{loss:.4f}.pt"
+    )
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    torch.save({
+        "epoch":                epoch,
+        "model_state_dict":     model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict":    scaler.state_dict(),
+        "loss":                 loss,
+    }, path)
+    logger.info(f"Checkpoint mentve: {path}")
 
 
 if __name__ == "__main__":
-    logger = setup_logger()
+    logger = setup_logger(level=logging.INFO)
     logger.info("Start")
 
-    BASE_FOLDER = r"C:\aimotive projektmunka\train\highway"
-    CSV_PATH = "./data/id_data.csv"
-    OUTPUT_DIR = "batch_test"
-    EPOCHS = 5
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Device: {device}")
 
-    # model = model().to(device)
-    # optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    model = smp.Unet(
+        encoder_name="resnet34",
+        encoder_weights="imagenet",
+        in_channels=3,
+        classes=1
+    ).to(device)
 
-    # Dataset és DataLoader (batch_size=5)
-    dataset = Dataset(csv_path=CSV_PATH, folder=BASE_FOLDER, logger=logger)
-    train_loader = DataLoader(dataset, batch_size=5, shuffle=True)
+    logger.info("Model loaded")
 
-    # csak az első batch lekérése
-    batch_data = next(iter(train_loader))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    scaler = GradScaler("cuda")
 
-    images = batch_data['image']   # [5, 3, 704, 1024]
-    depths = batch_data['depth']   # [5, 3, 704, 1024]
-    masks = batch_data['gt_mask']  # [5, 3, 704, 1024]
+    datasets = [
+        Dataset(
+            csv_path=CSV_PATH,
+            folder=os.path.join(BASE_FOLDER, d),
+            logger=logger
+        ) for d in ["highway", "night", "rain", "urban"]
+    ]
 
-    logger.info("random frame:")
+    combined_dataset = ConcatDataset(datasets)
 
-    random_predictions = torch.rand_like(depths)*50.0
+    train_loader = DataLoader(
+        combined_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
 
-    #mask l1 loss
-    loss = lossfunc(random_predictions, depths, masks)
+    total_losses_per_epoch = pd.DataFrame()
 
-    images = images.to(device)
-    depths = depths.to(device)
-    masks = masks.to(device)
+    for epoch in range(1, EPOCHS + 1):
+        logger.info(f"==================== Epoch: {epoch}/{EPOCHS} ====================")
 
+        logger.info(f"Dataset mérete: {len(combined_dataset)}")
+        logger.info(f"Batch-ek száma: {len(train_loader)}")
 
-    for i in range(5):
-        img = images[i]
-        depth = depths[i]
-        mask = masks[i]
+        losses_per_epoch, train_loss = train_epoch(
+            model=model,
+            train_loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            scaler=scaler,
+            grad_accum_steps=GRAD_ACCUM_STEPS,
+            logger=logger
+        )
+        logger.info(f"Train loss: {train_loss:.4f} m")
 
-        logger.debug(f"Image data: {img}")
-        logger.debug(f"Image shape: {img.shape}")
+        scheduler.step()
+        logger.info(f"LR: {scheduler.get_last_lr()[0]:.2e}")
+        total_losses_per_epoch[f"EPOCH_{epoch}"] = losses_per_epoch
 
-        logger.debug(f"Depth data: {depth}")
-        logger.debug(f"Depth shape: {depth.shape}")
+        save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            epoch=epoch,
+            loss=train_loss,
+            logger=logger
+        )
 
-        logger.debug(f"Mask data: {mask}")
-        logger.debug(f"Mask shape: {mask.shape}")
+        total_losses_per_epoch.to_csv(
+            f"losses_{epoch}.csv",
+            index=False
+        )
 
-        prefix = f"sample_{i}"
-
-        # np.save(os.path.join(OUTPUT_DIR, f"{prefix}_depth_raw.npy"), depth)
-        # np.save(os.path.join(OUTPUT_DIR, f" {prefix}_mask_raw.npy"), mask)
-
-        # eredeti kép
-        # cv2.imwrite(os.path.join(OUTPUT_DIR, f"{prefix}_image.jpg"), img)
-
-        # mask
-        # mask_visual = (mask_np * 255).astype(np.uint8)
-        # cv2.imwrite(os.path.join(OUTPUT_DIR, f"{prefix}_mask.png"), mask_visual)
-    """
-        #színes mélység
-        depth_visual = np.zeros_like(img_np)
-        if np.any(mask_np > 0):
-            d_min, d_max = depth_np[mask_np > 0].min(), depth_np[mask_np > 0].max()
-            depth_norm = 255 * (depth_np - d_min) / (d_max - d_min + 1e-8)
-            depth_norm = depth_norm.astype(np.uint8)
-            depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_JET)
-            depth_visual = cv2.bitwise_and(depth_color, depth_color, mask=mask_visual)
-
-        cv2.imwrite(os.path.join(OUTPUT_DIR, f"{prefix}_depth_view.png"), depth_visual)
-    """
-    logger.info(f"Loss: {loss.item():.4f} méter")
     logger.info("Done")
